@@ -1,0 +1,373 @@
+#!/usr/bin/env node
+
+(function(){
+  var prod = process.env.NODE_ENV === 'production',
+      requiredNodePaths = [
+        '/node_modules',
+        '/ncs-pkg/webui-server/node_modules'
+      ],
+      maybeAddNodePath;
+
+  maybeAddNodePath = function(path) {
+    var nodeModulesPath = (prod ? 'dist' : 'src') + path,
+        hasNodeModulesPath = process.env.NODE_PATH && process.env.NODE_PATH.indexOf(nodeModulesPath) > -1;
+
+    if (!hasNodeModulesPath) {
+      process.env.NODE_PATH = __dirname + '/../' + nodeModulesPath +
+      (process.env.NODE_PATH ? ':' + process.env.NODE_PATH : '');
+    }
+  };
+
+  requiredNodePaths.forEach(maybeAddNodePath);
+  require('module')._initPaths();
+})();
+
+require('coffee-script/register');
+
+var // deps
+    JSON = require('json3'),
+    os = require('os'),
+    cluster = require('cluster'),
+    http = require('http'),
+    bunyan = require('bunyan'),
+    _ = require('lodash'),
+    // funs
+    onUncaughtException,
+    onHeartbeat,
+    main,
+    mainGetPort,
+    mainMaster,
+    mainWorker,
+    // log
+    streams = [],
+    log,
+    heapdump,
+    // misc
+    env = process.env,
+    prod = (env.NODE_ENV === 'production'),
+    defaultEnv,
+    hyper,
+    hyperApp,
+    workerId = cluster.worker && cluster.worker.id || 'M';
+
+// INIT
+
+defaultEnv = {
+  DEBUG: '',
+  HYPER_ADDRESS: '127.0.0.1',
+  HYPER_HEARTBEAT_INTERVAL: 15, // minutes, empty to disable
+  HYPER_LOG_DIR: '',            // empty to disable
+  HYPER_LOG_LEVEL: 'info',
+  HYPER_LOG_SRC: '',            // empty to disable
+  HYPER_LOG_STDOUT: '',         // empty to disable
+  HYPER_MEM_THRESHOLD_RSS: '',  // MB, empty to disable
+  HYPER_PORT: '8081',
+  HYPER_THREADS: '',            // os.cpus().length,
+};
+
+if (!prod) {
+  Error.stackTraceLimit = Infinity;
+  require('longjohn').async_trace_limit = -1;
+
+  _.defaults(env, {
+    DEBUG_HOST: 'localhost',
+    DEBUG_PORT: '9999',
+    NODE_HEAPDUMP_OPTIONS: 'nosignal',
+    HYPER_LOG_DIR: '.',
+    HYPER_LOG_LEVEL: 'trace',
+    HYPER_LOG_SRC: 'true',
+    HYPER_LOG_STDOUT: 'true',
+    HYPER_THREADS: '0'
+  });
+}
+
+_.defaults(env, defaultEnv);
+
+_.defaults(env, {
+  DEBUG: '',
+  DEBUG_HOST: '',
+  DEBUG_PORT: '',
+  NODE_ENV: '',
+  NODE_PATH: ''
+});
+
+// EVENT HANDLERS
+
+onExit = function(code) {
+  log.info('Non-worker exit');
+};
+
+onUncaughtException = function(err) {
+  var exceptionLog = {
+      tag_uncaught: true,
+      err: {
+        code: err.code,
+        message: err.message,
+        stack: err.stack
+      }
+    };
+  console.error(err);
+  console.error(err.stack);
+  try {
+    if (heapdump) {
+      exceptionLog.heapsnapshot = {
+        filename: 'hyper.' + workerId + '.uncaughtException.heapsnapshot'
+      };
+      heapdump.writeSnapshot(env.HYPER_LOG_DIR + '/' + exceptionLog.heapsnapshot.filename);
+    }
+    log.fatal(exceptionLog, 'Uncaught exception');
+  } catch(e) {
+    console.error(e);
+  }
+  if (workerId !== 'M') {
+    hyper.close(function() {
+      process.exit(1);
+    });
+    setTimeout(function() {
+      log.error('HTTP server is stalling');
+      process.exit(1);
+    })
+  } else {
+    process.exit(1);
+  }
+};
+
+onHeartbeat = (function() {
+  var thresholdRss = env.HYPER_MEM_THRESHOLD_RSS;
+
+  return function() {
+    var level = 'info',
+        currentRss,
+        heartbeatLog = {
+          tag_heartbeat: true,
+          process: {
+            memoryUsage: process.memoryUsage(),
+            uptime: process.uptime()
+          },
+          os: {
+            loadavg: os.loadavg(),
+            totalmem: os.totalmem(),
+            freemem: os.freemem()
+          }
+        };
+
+    if (heapdump) {
+      currentRss = heartbeatLog.process.memoryUsage.rss / (1024 * 1024);
+      if (currentRss > thresholdRss) {
+        level = 'warn';
+        heartbeatLog.heapsnapshot = {
+          currentRss: currentRss,
+          thresholdRss: thresholdRss,
+          filename: 'hyper.' + workerId + '.' + thresholdRss + 'MB.heapsnapshot'
+        };
+        heapdump.writeSnapshot(env.HYPER_LOG_DIR + '/' + heartbeatLog.heapsnapshot.filename);
+        thresholdRss += 25;
+      }
+    }
+
+    log[level](heartbeatLog, 'Heartbeat');
+  };
+})();
+
+// LOG
+
+if (env.HYPER_LOG_DIR) {
+  streams.push({
+    name: 'default',
+    type: 'rotating-file',
+    path: env.HYPER_LOG_DIR + '/hyper.log',
+    period: '1d',
+    count: 7,
+    level: env.HYPER_LOG_LEVEL
+  });
+}
+
+if (env.HYPER_LOG_STDOUT) {
+  streams.push({
+    name: 'stdout',
+    stream: process.stdout,
+    level: 'trace'
+  });
+}
+
+log = bunyan.createLogger({
+  name: 'hyper',
+  src: Boolean(env.HYPER_LOG_SRC),
+  serializers: null,
+  streams: streams
+});
+
+if (workerId !== 'M') {
+  log = log.child({
+    tag_worker: true,
+    worker_id: workerId
+  });
+}
+
+// MAIN
+
+main = function() {
+  process.on('uncaughtException', onUncaughtException);
+
+  if (env.HYPER_MEM_THRESHOLD_RSS && env.HYPER_LOG_DIR) {
+    heapdump = require('heapdump');
+  }
+};
+
+mainGetPort = function(next) {
+  if (env.HYPER_PORT === '0') {
+    http.createServer().listen(0).on('listening', function(){
+      env.HYPER_PORT = this.address().port.toString();
+      this.close();
+    }).on('close', next);
+  } else {
+    next();
+  }
+};
+
+mainMaster = function() {
+  var i,
+      makeSimpleLog,
+      startupLog = {
+        tag_event: 'starting'
+      };
+
+  makeSimpleLog = function(event) {
+    return function(worker) {
+      var level = 'info',
+          args = Array.prototype.slice.call(arguments, 1);
+
+      args = args.length ? ' ' + JSON.stringify(args) : '';
+
+      if (event === 'error') level = 'error';
+      if (event === 'exit' && arguments[0] !== 0) level = 'error';
+
+      log[level]({
+        tag_worker: true,
+        tag_event: event,
+        worker_id: worker.id,
+      }, 'Worker ' + event + args);
+    }
+  };
+
+  // Exit when pipe is closed
+  if (prod) {
+    process.stdin.resume();
+    process.stdin.on('close', function() {
+      makeSimpleLog('stdin_close')(arguments);
+      process.exit(0);
+    });
+  }
+
+  main();
+  cluster
+    .on('fork', makeSimpleLog('fork'))
+    .on('online', makeSimpleLog('online'))
+    .on('listening', makeSimpleLog('listening'))
+    .on('disconnect', makeSimpleLog('disconnect'))
+    .on('exit', makeSimpleLog('exit'))
+    .on('exit', function(worker, code, signal) {
+      // Replace event
+      var event = 'replace',
+          args,
+          newWorker;
+
+      if (code === 0) return;
+      newWorker = cluster.fork();
+      args = ' [' + newWorker.id + ']';
+
+      log.info({
+        tag_worker: true,
+        tag_event: event,
+        worker_id: worker.id,
+      }, 'Worker ' + event + args);
+    });
+
+  if (prod) {
+    startupLog.process = {
+      arch: process.arch,
+      env: env,
+      memoryUsage: process.memoryUsage(),
+      platform: process.platform,
+      versions: process.versions,
+      uptime: process.uptime()
+    };
+
+    startupLog.os = {
+      arch: os.arch(),
+      cpus: os.cpus(),
+      freemem: os.freemem(),
+      hostame: os.hostname(),
+      loadavg: os.loadavg(),
+      networkInterfaces: os.networkInterfaces(),
+      platform: os.platform(),
+      release: os.release(),
+      totalmem: os.totalmem(),
+      type: os.type(),
+      uptime: os.uptime()
+    }
+  } else {
+    startupLog.process = {
+      env: _.merge({
+        DEBUG: env.DEBUG,
+        DEBUG_HOST: env.DEBUG_HOST,
+        DEBUG_PORT: env.DEBUG_PORT,
+        NODE_ENV: env.NODE_ENV,
+        NODE_PATH: env.NODE_PATH
+      }, _.mapValues(defaultEnv, function(value, key) {
+        return env[key];
+      }))
+    }
+  }
+  startupLog.process.env.NODE_PATH = _.compact(_.uniq(startupLog.process.env.NODE_PATH.split(':')));
+  startupLog.process.env.HYPER_NODE_MODULES = startupLog.process.env.HYPER_NODE_MODULES.split(',');
+  log.info(startupLog, 'Starting');
+
+  for (i = 0; i < parseInt(env.HYPER_THREADS, 10); i++) {
+    cluster.fork()
+  }
+};
+
+mainWorker = function() {
+  main();
+  hyperApp = require('app')({
+    address: env.HYPER_ADDRESS,
+    port: parseInt(env.HYPER_PORT, 10),
+    log: log
+  });
+  http.globalAgent.maxSockets = Infinity;
+  hyper = http.createServer(hyperApp);
+
+  hyper.listen(parseInt(env.HYPER_PORT, 10), env.HYPER_ADDRESS);
+  if (workerId !== 'M') return;
+  hyperApp.log.info({
+    tag_event: 'listening'
+  }, 'Non-worker listening ' + JSON.stringify([{
+    address: env.HYPER_ADDRESS,
+    port: parseInt(env.HYPER_PORT, 10)
+  }]));
+
+  if (env.HYPER_HEARTBEAT_INTERVAL) {
+    setInterval(onHeartbeat, parseInt(env.HYPER_HEARTBEAT_INTERVAL, 10) * 60 * 1000);
+  }
+};
+
+// RUN
+
+mainGetPort(function() {
+  if (cluster.isMaster) {
+    console.log('PID=' + process.pid);
+    console.log('HYPER_PORT=' + env.HYPER_PORT);
+    console.log('---');
+
+    if (!prod) {
+      console.log('Started server on http://127.0.0.1:' + env.HYPER_PORT);
+      console.log('Press CTRL-C to stop');
+      console.log('To debug, run: kill -SIGUSR1 ' + process.pid);
+    }
+
+    mainMaster();
+    if (parseInt(env.HYPER_THREADS, 10)) return;
+  }
+  mainWorker();
+});
